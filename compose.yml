@@ -1,0 +1,6 @@
+services:
+  audit:
+    build: .
+    env_file: .env
+    volumes:
+      - ./cache:/app/cache

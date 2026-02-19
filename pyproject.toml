@@ -1,0 +1,13 @@
+[project]
+name = "paperless-bank-audit"
+version = "0.1.0"
+description = "Cross-reference bank statement transactions against Paperless-ngx documents"
+requires-python = ">=3.12"
+dependencies = [
+    "openai",
+    "requests",
+    "python-dotenv",
+]
+
+[project.scripts]
+audit = "audit:main"

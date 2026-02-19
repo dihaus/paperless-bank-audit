@@ -12,10 +12,34 @@ CLI tool that cross-references bank statement transactions against documents in 
 
 ## Setup
 
+### With Docker Compose
+
 ```bash
-pip install -r requirements.txt
 cp .env.example .env
+# edit .env with your credentials
 ```
+
+Run:
+
+```bash
+docker compose run --rm audit 2026 02
+```
+
+### Local with uv
+
+```bash
+uv sync
+cp .env.example .env
+# edit .env with your credentials
+```
+
+Run:
+
+```bash
+uv run python audit.py 2026 02
+```
+
+## Configuration
 
 Edit `.env`:
 
@@ -31,19 +55,7 @@ BANK_STATEMENT_TAG_ID=42
 - **OPENAI_API_KEY** — OpenAI API key
 - **BANK_STATEMENT_TAG_ID** — numeric ID of the tag used for bank statements (find it in Paperless URL when clicking on the tag, e.g. `/tags/42/`)
 
-## Usage
-
-```bash
-python audit.py YYYY MM
-```
-
-Example:
-
-```bash
-python audit.py 2026 02
-```
-
-Output:
+## Output
 
 ```
 Auditing bank statements for 2026-02
