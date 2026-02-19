@@ -5,11 +5,12 @@ CLI tool that cross-references bank statement transactions against documents in 
 ## How it works
 
 1. Fetches bank statement documents from Paperless by tag ID and month
-2. Sends the statement text to OpenAI to extract a structured list of transactions
-3. For each transaction, searches Paperless for a matching document (invoice, receipt, etc.) — bank statements are excluded from matching
-4. Prints a report showing which transactions have matching documents and which don't
-5. Optionally writes results as a note on each bank statement in Paperless
-6. Caches results locally — OpenAI is called once per statement, already matched transactions are skipped on re-runs
+2. Downloads the original file — if it's XLS/XLSX, parses it directly (no OCR needed). Falls back to OCR text for PDFs
+3. Sends structured data to OpenAI to extract a list of transactions
+4. For each transaction, searches Paperless for a matching document by invoice reference, counterparty, or amount. Bank statements are excluded from matching
+5. Credits (incoming payments) are matched against invoices up to 1 year back. Debits are matched within 30 days
+6. Optionally writes results as a note on each bank statement in Paperless
+7. Caches results locally — OpenAI is called once per statement, already matched transactions are skipped on re-runs
 
 ## Configuration
 
@@ -39,13 +40,13 @@ WRITE_NOTES=false
 
 ```bash
 uv sync
-uv run python audit.py 2026 1
+uv run python audit.py 2025 1
 ```
 
 ### Docker
 
 ```bash
-docker compose run --rm audit 2026 1
+docker compose run --rm audit 2025 1
 ```
 
 ## Output
@@ -54,10 +55,13 @@ Console:
 
 ```
 ── Bank Statement January 2025 (#12) ──
+  Downloading original from Paperless...
+  Parsed XLS: statement_january_2025.xls
+  Extracting transactions via OpenAI...
   Found 8 transactions
   ✗ 2025-01-05 |     -45.00 | ACME HOSTING                   | NOT FOUND
-  ✓ 2025-01-10 |    -250.00 | Office Supplies Ltd            | → #34
-  ✓ 2025-01-15 |     120.00 | Client ABC                     | → #37
+  ✓ 2025-01-10 |    -250.00 | Office Supplies Ltd            | → #34 Invoice INV-2025-042
+  ✓ 2025-01-15 |     120.00 | Client ABC                     | → #37 INV-2024-198
   📝 Note updated on #12
 
 ════════════════════════════════════════════════════════════
@@ -89,6 +93,12 @@ Invoice #INV-2025-042
 → #34 Office Supplies Invoice
 ```
 
+## Matching strategy
+
+1. **By reference** — extracts invoice/document numbers from transaction description and searches Paperless (most precise)
+2. **By counterparty + amount** — searches for documents matching both the counterparty name and exact amount
+3. **By amount only** — last resort, narrow date range (±5 days)
+
 ## Re-running
 
 Running the same month again will:
@@ -99,5 +109,5 @@ Running the same month again will:
 To force a full re-parse from OpenAI, delete the cache file:
 
 ```bash
-rm cache/2026-01.json
+rm cache/2025-01.json
 ```
