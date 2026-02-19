@@ -6,12 +6,16 @@ Usage: python audit.py YYYY MM
 """
 
 import json
+import re
 import sys
-from datetime import date
+import tempfile
+from datetime import date, timedelta
 from pathlib import Path
 
 import openai
+import openpyxl
 import requests
+import xlrd
 from dotenv import load_dotenv
 import os
 
@@ -62,6 +66,24 @@ def get_statements(tag_id, year, month):
     return docs
 
 
+def download_original(doc_id):
+    """Download the original file from Paperless. Returns (bytes, filename)."""
+    resp = requests.get(
+        f"{PAPERLESS_URL}/api/documents/{doc_id}/download/",
+        headers=HEADERS,
+        params={"original": "true"},
+    )
+    resp.raise_for_status()
+    # Extract filename from Content-Disposition header
+    cd = resp.headers.get("Content-Disposition", "")
+    filename = ""
+    if "filename=" in cd:
+        match = re.search(r'filename="([^"]+)"', cd)
+        if match:
+            filename = match.group(1)
+    return resp.content, filename
+
+
 def get_document_content(doc_id):
     """Get the full text content of a document."""
     doc = paperless_get(f"/api/documents/{doc_id}/")
@@ -77,6 +99,56 @@ def search_documents(query, date_from=None, date_to=None):
         params["created__date__lte"] = date_to
     data = paperless_get("/api/documents/", params)
     return data.get("results", [])
+
+
+# ── XLS parsing ───────────────────────────────────────────────────────
+
+def parse_xls_to_text(file_bytes, filename):
+    """Parse XLS/XLSX file into structured text for OpenAI."""
+    suffix = Path(filename).suffix.lower() if filename else ""
+    if suffix not in (".xls", ".xlsx"):
+        return None
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(file_bytes)
+        tmp_path = f.name
+
+    try:
+        if suffix == ".xls":
+            return _parse_xls_legacy(tmp_path)
+        else:
+            return _parse_xlsx(tmp_path)
+    except Exception:
+        return None
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def _parse_xls_legacy(path):
+    """Parse old-format .xls (BIFF) using xlrd."""
+    wb = xlrd.open_workbook(path)
+    lines = []
+    for sheet in wb.sheets():
+        for row_idx in range(sheet.nrows):
+            cells = [str(sheet.cell_value(row_idx, col)) for col in range(sheet.ncols)]
+            if not any(cells):
+                continue
+            lines.append(" | ".join(cells))
+    return "\n".join(lines)
+
+
+def _parse_xlsx(path):
+    """Parse .xlsx using openpyxl."""
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    lines = []
+    for sheet in wb.worksheets:
+        for row in sheet.iter_rows(values_only=True):
+            cells = [str(c) if c is not None else "" for c in row]
+            if not any(cells):
+                continue
+            lines.append(" | ".join(cells))
+    wb.close()
+    return "\n".join(lines)
 
 
 # ── OpenAI ────────────────────────────────────────────────────────────
@@ -98,7 +170,9 @@ def extract_transactions(statement_text):
                     '- "amount": transaction amount as a number (positive for '
                     "credits, negative for debits)\n"
                     '- "counterparty": name of the other party\n'
-                    '- "description": payment description/reference\n\n'
+                    '- "description": payment description/reference\n'
+                    '- "ref": invoice or document reference number if mentioned '
+                    "(e.g. invoice number, contract number), otherwise empty string\n\n"
                     "Return ONLY the JSON array, no other text."
                 ),
             },
@@ -136,36 +210,77 @@ def save_cache(year, month, data):
 
 # ── Matching ──────────────────────────────────────────────────────────
 
+def extract_refs(tx):
+    """Extract searchable references from transaction description and ref field."""
+    refs = []
+    ref = tx.get("ref", "")
+    if ref:
+        refs.append(ref)
+
+    desc = tx.get("description", "")
+    # Look for invoice-like patterns: DH-202512-10218, INV-2025-042, Nr. 123, etc.
+    patterns = [
+        r"[A-Z]{2,}-\d[\d-]+\d",       # DH-202512-10218, INV-2025-042
+        r"[Nn]r\.?\s*(\S+)",            # Nr. 12345 or nr 12345
+        r"[Rr]ēķin\S*\s+\S*\s*(\S+)",  # rēķins/rēķinu Nr ...
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, desc):
+            refs.append(m.group(0) if not m.groups() else m.group(1))
+
+    return refs
+
+
+def find_non_statement(results):
+    """Return first result that is not a bank statement."""
+    for doc in results:
+        if BANK_STATEMENT_TAG_ID in doc.get("tags", []):
+            continue
+        return doc
+    return None
+
+
 def match_transaction(tx):
     """Try to find a document in Paperless that matches this transaction."""
-    amount = tx["amount"]
-    counterparty = tx["counterparty"]
     tx_date = tx["date"]
+    counterparty = tx["counterparty"]
+    abs_amount = f"{abs(tx['amount']):.2f}"
 
-    # Search by counterparty + amount
-    abs_amount = f"{abs(amount):.2f}"
-    queries = [
-        f"{counterparty} {abs_amount}",
-        counterparty,
-        abs_amount,
-    ]
+    # Credits (incoming payments) are usually for invoices from previous months
+    is_credit = tx["amount"] > 0
+    lookback = 365 if is_credit else 30
 
-    # Date range: ±7 days
     try:
         d = date.fromisoformat(tx_date)
-        from datetime import timedelta
-        date_from = (d - timedelta(days=7)).isoformat()
-        date_to = (d + timedelta(days=7)).isoformat()
+        date_from = (d - timedelta(days=lookback)).isoformat()
+        date_to = (d + timedelta(days=14)).isoformat()
     except ValueError:
         date_from = date_to = None
 
-    for query in queries:
-        results = search_documents(query, date_from, date_to)
-        for doc in results:
-            # Skip documents with the bank statement tag
-            if BANK_STATEMENT_TAG_ID in doc.get("tags", []):
-                continue
+    # 1. Search by reference numbers (most precise)
+    for ref in extract_refs(tx):
+        results = search_documents(ref, date_from, date_to)
+        doc = find_non_statement(results)
+        if doc:
             return doc
+
+    # 2. Search by counterparty + amount
+    results = search_documents(f"{counterparty} {abs_amount}", date_from, date_to)
+    doc = find_non_statement(results)
+    if doc:
+        return doc
+
+    # 3. Search by amount only (last resort, narrow date range)
+    try:
+        d = date.fromisoformat(tx_date)
+        narrow_from = (d - timedelta(days=5)).isoformat()
+        narrow_to = (d + timedelta(days=5)).isoformat()
+    except ValueError:
+        narrow_from = narrow_to = None
+    results = search_documents(abs_amount, narrow_from, narrow_to)
+    doc = find_non_statement(results)
+    if doc:
+        return doc
 
     return None
 
@@ -268,10 +383,23 @@ def main():
             transactions = cache["statements"][doc_id]["transactions"]
             print(f"  Using cached transactions ({len(transactions)} items)")
         else:
-            # Get content and extract via OpenAI
-            print("  Fetching content from Paperless...")
-            content = get_document_content(stmt["id"])
-            if not content.strip():
+            # Try to download original and parse as XLS
+            print("  Downloading original from Paperless...")
+            content = None
+            try:
+                file_bytes, filename = download_original(stmt["id"])
+                content = parse_xls_to_text(file_bytes, filename)
+                if content:
+                    print(f"  Parsed XLS: {filename}")
+            except Exception as e:
+                print(f"  Could not download original: {e}")
+
+            # Fallback to OCR text content
+            if not content:
+                print("  Using OCR text content...")
+                content = get_document_content(stmt["id"])
+
+            if not content or not content.strip():
                 print("  WARNING: Empty document content, skipping")
                 continue
 
