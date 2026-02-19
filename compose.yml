@@ -2,5 +2,6 @@ services:
   audit:
     build: .
     env_file: .env
+    network_mode: host
     volumes:
       - ./cache:/app/cache
