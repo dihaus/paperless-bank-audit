@@ -99,6 +99,22 @@ Invoice #INV-2025-042
 2. **By counterparty + amount** — searches for documents matching both the counterparty name and exact amount
 3. **By amount only** — last resort, narrow date range (±5 days)
 
+## Scheduled runs (cron)
+
+`cron-audit.sh` runs the audit for the current and previous month. Set it up with cron:
+
+```bash
+crontab -e
+```
+
+Add (runs at 9:00 and 18:00 daily):
+
+```
+0 9,18 * * * /path/to/paperless-bank-audit/cron-audit.sh >> /path/to/paperless-bank-audit/cache/cron.log 2>&1
+```
+
+Log output goes to `cache/cron.log`.
+
 ## Re-running
 
 Running the same month again will:
