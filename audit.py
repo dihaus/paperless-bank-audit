@@ -21,6 +21,7 @@ PAPERLESS_URL = os.environ["PAPERLESS_URL"].rstrip("/")
 PAPERLESS_TOKEN = os.environ["PAPERLESS_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 BANK_STATEMENT_TAG_ID = int(os.environ["BANK_STATEMENT_TAG_ID"])
+WRITE_NOTES = os.environ.get("WRITE_NOTES", "false").lower() in ("true", "1", "yes")
 
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
@@ -160,11 +161,75 @@ def match_transaction(tx):
 
     for query in queries:
         results = search_documents(query, date_from, date_to)
-        if results:
-            # Return best match (first result)
-            return results[0]
+        for doc in results:
+            # Skip documents with the bank statement tag
+            if BANK_STATEMENT_TAG_ID in doc.get("tags", []):
+                continue
+            return doc
 
     return None
+
+
+# ── Notes ─────────────────────────────────────────────────────────
+
+AUDIT_NOTE_PREFIX = "[AUDIT]"
+
+
+def get_existing_audit_note(doc_id):
+    """Find an existing audit note on a document. Returns (note_id, text) or (None, None)."""
+    data = paperless_get(f"/api/documents/{doc_id}/notes/")
+    for note in data:
+        if note.get("note", "").startswith(AUDIT_NOTE_PREFIX):
+            return note["id"], note["note"]
+    return None, None
+
+
+def format_tx_block(tx, symbol):
+    """Format a single transaction as a multi-line block."""
+    lines = [f"{symbol} {tx['date']} / {tx['amount']:.2f}"]
+    lines.append(tx["counterparty"])
+    desc = tx.get("description", "")
+    if desc:
+        lines.append(desc)
+    if tx.get("matched_doc_id"):
+        lines.append(f"→ #{tx['matched_doc_id']} {tx.get('matched_title', '')}")
+    return "\n".join(lines)
+
+
+def write_audit_note(doc_id, transactions):
+    """Write or update the audit note on a statement document."""
+    missing = [tx for tx in transactions if not tx.get("matched_doc_id")]
+    matched = [tx for tx in transactions if tx.get("matched_doc_id")]
+    total = len(transactions)
+
+    parts = [f"{AUDIT_NOTE_PREFIX} {len(matched)}/{total}"]
+
+    if missing:
+        parts.append(f"\n[MISSING][{len(missing)}/{total}]")
+        for tx in missing:
+            parts.append(format_tx_block(tx, "✗"))
+
+    if matched:
+        parts.append(f"\n[MATCHED][{len(matched)}/{total}]")
+        for tx in matched:
+            parts.append(format_tx_block(tx, "✓"))
+
+    note_text = "\n\n".join(parts)
+
+    # Delete old audit note if exists
+    old_id, _ = get_existing_audit_note(doc_id)
+    if old_id:
+        requests.delete(
+            f"{PAPERLESS_URL}/api/documents/{doc_id}/notes/?id={old_id}",
+            headers=HEADERS,
+        )
+
+    # Create new note
+    requests.post(
+        f"{PAPERLESS_URL}/api/documents/{doc_id}/notes/",
+        headers=HEADERS,
+        json={"note": note_text},
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -239,6 +304,11 @@ def main():
             else:
                 total_unmatched += 1
                 print(f"  ✗ {tx['date']} | {tx['amount']:>10.2f} | {tx['counterparty']:<30} | NOT FOUND")
+
+        # Write note to Paperless
+        if WRITE_NOTES:
+            write_audit_note(stmt["id"], transactions)
+            print(f"  📝 Note updated on #{doc_id}")
 
         print()
 

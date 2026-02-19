@@ -6,9 +6,10 @@ CLI tool that cross-references bank statement transactions against documents in 
 
 1. Fetches bank statement documents from Paperless by tag ID and month
 2. Sends the statement text to OpenAI to extract a structured list of transactions
-3. For each transaction, searches Paperless for a matching document (invoice, receipt, etc.)
+3. For each transaction, searches Paperless for a matching document (invoice, receipt, etc.) — bank statements are excluded from matching
 4. Prints a report showing which transactions have matching documents and which don't
-5. Caches results locally — OpenAI is called once per statement, already matched transactions are skipped on re-runs
+5. Optionally writes results as a note on each bank statement in Paperless
+6. Caches results locally — OpenAI is called once per statement, already matched transactions are skipped on re-runs
 
 ## Configuration
 
@@ -23,12 +24,14 @@ PAPERLESS_URL=http://localhost:8001
 PAPERLESS_TOKEN=your-api-token
 OPENAI_API_KEY=sk-your-key
 BANK_STATEMENT_TAG_ID=3
+WRITE_NOTES=false
 ```
 
 - **PAPERLESS_URL** — your Paperless-ngx instance URL
 - **PAPERLESS_TOKEN** — API token (Settings → Auth Tokens in Paperless web UI)
 - **OPENAI_API_KEY** — OpenAI API key
 - **BANK_STATEMENT_TAG_ID** — numeric ID of the tag used for bank statements (find it in Paperless URL when clicking on the tag, e.g. `/tags/3/`)
+- **WRITE_NOTES** — set to `true` to write audit results as a note on each bank statement in Paperless (default: `false`)
 
 ## Usage
 
@@ -47,23 +50,43 @@ docker compose run --rm audit 2026 1
 
 ## Output
 
+Console:
+
 ```
-Auditing bank statements for 2026-01
-
-Found 2 statement(s)
-
-── Swedbank January 2026 (#90) ──
-  Extracting transactions via OpenAI...
-  Found 13 transactions
-  ✓ 2026-01-04 |      72.60 | ASTRONIK. SIA                  | → #55 Invoice
-  ✗ 2026-01-20 |    -630.00 | Marina Ostanina                | NOT FOUND
-  ✓ 2026-01-28 |  -15000.00 | Em stark, sia                  | → #96 Loan agreement
+── Bank Statement January 2025 (#12) ──
+  Found 8 transactions
+  ✗ 2025-01-05 |     -45.00 | ACME HOSTING                   | NOT FOUND
+  ✓ 2025-01-10 |    -250.00 | Office Supplies Ltd            | → #34
+  ✓ 2025-01-15 |     120.00 | Client ABC                     | → #37
+  📝 Note updated on #12
 
 ════════════════════════════════════════════════════════════
-Total: 13 transactions
-  Matched:   11
+Total: 8 transactions
+  Matched:   6
   Unmatched: 2
-  Coverage:  85%
+  Coverage:  75%
+```
+
+Paperless note (when `WRITE_NOTES=true`):
+
+```
+[AUDIT] 6/8
+
+[MISSING][2/8]
+
+✗ 2025-01-05 / -45.00
+ACME HOSTING
+Monthly server fee
+
+✗ 2025-01-22 / -19.99
+Cloud IDE Subscription
+
+[MATCHED][6/8]
+
+✓ 2025-01-10 / -250.00
+Office Supplies Ltd
+Invoice #INV-2025-042
+→ #34 Office Supplies Invoice
 ```
 
 ## Re-running
